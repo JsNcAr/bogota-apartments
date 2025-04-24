@@ -8,11 +8,16 @@ Classes:
 
 # useful for handling different item types with a single interface
 from bogota_apartments.items import ApartmentsItem
-from scrapy.exceptions import DropItem
+from scrapy.exceptions import DropItem, NotConfigured
 from scrapy.utils.project import get_project_settings
 from datetime import datetime
 import logging
 import pymongo
+
+# Logger a nivel de módulo (opcional, pero si lo usas consistentemente está bien)
+# O puedes usar el self.logger definido en __init__ en todo el módulo.
+# logger = logging.getLogger(__name__) # Ya lo tienes en __init__
+
 
 class MongoDBPipeline(object):
     """
@@ -39,10 +44,14 @@ class MongoDBPipeline(object):
         Args:
             mongo_uri (str): The URI of the MongoDB instance.
             mongo_db (str): The name of the MongoDB database.
+
         """
         self.mongo_uri = mongo_uri
         self.mongo_db = mongo_db
         self.logger = logging.getLogger(__name__)
+        self.client = None
+        self.db = None
+        self.enabled = True  # Asume habilitado hasta que open_spider falle o se deshabilite
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -55,9 +64,22 @@ class MongoDBPipeline(object):
         Returns:
             MongoDBPipeline: An instance of the MongoDBPipeline class.
         """
+        mongo_uri = crawler.settings.get('MONGO_URI')
+        mongo_db = crawler.settings.get('MONGO_DATABASE')
+
+        # 3. Chequeo de configuración esencial
+        if not mongo_uri or not mongo_db:
+            # Lanza NotConfigured si falta la URI o DB. Scrapy desactivará el pipeline.
+            raise NotConfigured(
+                "MongoDB settings (MONGO_URI, MONGO_DATABASE) not found.")
+
+        # 4. Verifica si el pipeline está explícitamente deshabilitado en ITEM_PIPELINES
+        # (Scrapy maneja esto, pero es bueno saberlo)
+        # Si MongoDBPipeline no está en ITEM_PIPELINES, esta clase ni siquiera se instanciará.
+
         return cls(
-            mongo_uri=crawler.settings.get('MONGO_URI'),
-            mongo_db=crawler.settings.get('MONGO_DATABASE', 'items')
+            mongo_uri=mongo_uri,
+            mongo_db=mongo_db
         )
 
     def open_spider(self, spider):
@@ -67,10 +89,28 @@ class MongoDBPipeline(object):
         Args:
             spider (scrapy.Spider): The Scrapy spider.
         """
-        self.client = pymongo.MongoClient(self.mongo_uri)
-        self.db = self.client[self.mongo_db]
-        # start with a clean database
-        # self.db[self.collection].delete_many({})
+        # 5. Intenta conectar solo si las settings estaban presentes (pasó from_crawler)
+        try:
+            self.client = pymongo.MongoClient(self.mongo_uri)
+            # Forzar conexión/autenticación para detectar errores temprano
+            self.client.admin.command('ping')
+            self.db = self.client[self.mongo_db]
+            self.logger.info(
+                f"MongoDB connection opened for spider '{spider.name}'. DB: '{self.mongo_db}'.")
+            self.enabled = True
+        except pymongo.errors.ConnectionFailure as e:
+            self.logger.error(
+                f"Failed to connect to MongoDB at {self.mongo_uri}. Pipeline DISABLED. Error: {e}")
+            # 6. Deshabilita el pipeline si la conexión falla al inicio
+            self.enabled = False
+            self.client = None  # Asegurarse que no haya cliente
+            self.db = None
+        except Exception as e:  # Captura otros posibles errores de conexión/autenticación
+            self.logger.error(
+                f"Unexpected error connecting to MongoDB. Pipeline DISABLED. Error: {e}", exc_info=True)
+            self.enabled = False
+            self.client = None
+            self.db = None
 
     def close_spider(self, spider):
         """
@@ -79,11 +119,15 @@ class MongoDBPipeline(object):
         Args:
             spider (scrapy.Spider): The Scrapy spider.
         """
-        self.client.close()
+        # 7. Cierra la conexión solo si se estableció
+        if self.client:
+            self.client.close()
+            self.logger.info(
+                f"MongoDB connection closed for spider '{spider.name}'.")
 
     def process_item(self, item, spider):
         """
-        Processes the item and stores it in the MongoDB database.
+        Processes the item and stores it in the MongoDB database if enabled.
 
         Args:
             item (scrapy.Item): The Scrapy item.
@@ -92,88 +136,162 @@ class MongoDBPipeline(object):
         Returns:
             scrapy.Item: The processed Scrapy item.
         """
+        # Verifica si el pipeline está habilitado antes de procesar
+        if not self.enabled or self.client is None or self.db is None:
+            self.logger.debug(
+                f"MongoDB pipeline disabled or connection failed/None. Skipping DB operation for item {item.get('codigo', 'N/A')}.")
+            return item
+
+        # Continúa solo si el pipeline está habilitado y conectado
         data = dict(ApartmentsItem(item))
+        codigo = data.get('codigo')
 
-        if spider.name == 'metrocuadrado':
-            existing_item = self.db[self.collection].find_one({'codigo': data['codigo']})
-            data['caracteristicas'] = []
-            for key in ['featured_interior', 'featured_exterior', 'featured_zona_comun', 'featured_sector']:
-                if key in data:
-                    data['caracteristicas'] += data[key]
-                    del data[key]
+        if not codigo:
+            self.logger.warning(
+                f"Item sin 'codigo' descartado (antes de DB). URL: {data.get('url', 'N/A')}")
+            raise DropItem(f"Missing 'codigo' in item: {item}")
 
-            if existing_item:
-                existing_item['last_view'] = datetime.now()
+        try:
+            # Lógica específica por spider
+            if spider.name == 'metrocuadrado':
+                existing_item = self.db[self.collection].find_one(
+                    {'codigo': data['codigo']})
+                data['caracteristicas'] = []
+                for key in ['featured_interior', 'featured_exterior', 'featured_zona_comun', 'featured_sector']:
+                    if key in data:
+                        data['caracteristicas'] += data.get(key, [])
+                        del data[key]
 
-                if 'timeline' not in existing_item:
-                    existing_item['timeline'] = []
+                if existing_item:
+                    # Preparar la actualización del item existente
+                    update_data = existing_item
+                    update_data['last_view'] = datetime.now()
+                    timeline = update_data.setdefault('timeline', [])
 
-                try:
-                    fields = ['precio_venta', 'precio_arriendo']
-                    
-                    for field in fields:
-                        if field in data and field in existing_item and data[field] != existing_item[field]:
-                            if len(existing_item['timeline']) == 0:
-                                existing_item['timeline'].append({
-                                    'fecha': existing_item['datetime'],
-                                    field: existing_item[field],
+                    fields_to_track = ['precio_venta', 'precio_arriendo']
+                    price_changed = False
+                    for field in fields_to_track:
+                        if field in data and data[field] != update_data.get(field):
+                            if not timeline:
+                                timeline.append({
+                                    'fecha': update_data.get('datetime', datetime.now()),
+                                    field: update_data.get(field)
                                 })
-
-                            existing_item['timeline'].append({
+                            timeline.append({
                                 'fecha': datetime.now(),
                                 field: data[field],
                             })
-                            
-                            existing_item[field] = data[field]
-                except KeyError:
-                    self.logger.error('Error al actualizar el item: %s', data['codigo'])
-                    pass
-                
-                # Actualiza el item en la base de datos
-                self.db[self.collection].update_one({'codigo': data['codigo']}, {'$set': existing_item})
+                            update_data[field] = data[field]
+                            price_changed = True
+                        elif field not in update_data and field in data:
+                            update_data[field] = data[field]
+                            price_changed = True
 
-            else:
-                # Inserta el item en la base de datos si no existe
-                self.db[self.collection].insert_one(data)
+                    # Actualizar otros campos si es necesario
+                    update_data['imagenes'] = data.get('imagenes', [])
+                    update_data['descripcion'] = data.get('descripcion', '')
+                    # ... otros campos ...
 
-            return item
+                    result = self.db[self.collection].update_one(
+                        {'codigo': data['codigo']}, {'$set': existing_item})
 
-        elif spider.name == 'habi':
-            existing_item = self.db[self.collection].find_one({'codigo': data['codigo']})
-            if existing_item:
-                existing_item['last_view'] = datetime.now()
-                
-                if 'timeline' not in existing_item:
-                    existing_item['timeline'] = []
+                    # --- LOG INFO DESPUÉS DE UPDATE ---
+                    if result.modified_count > 0 or price_changed:
+                        precio = update_data.get('precio_arriendo') or update_data.get(
+                            'precio_venta', 'N/A')
+                        tipo_propiedad = data.get('tipo_propiedad', 'N/A')
+                        tipo_operacion = data.get('tipo_operacion', 'N/A')
+                        self.logger.info(
+                            f"Item ACTUALIZADO [Metrocuadrado]: Codigo={codigo}, Precio={precio}, Modificado={result.modified_count > 0}, CambioPrecio={price_changed}, TipoPropiedad={tipo_propiedad}, TipoOperacion={tipo_operacion}")
+                    # else: (Opcional: log debug si no hubo cambios)
+                    #    self.logger.debug(f"Item sin cambios detectados [Metrocuadrado]: Codigo={codigo}")
 
-                try:
-                    # Actualiza el precio de venta si ha cambiado
-                    if data['precio_venta'] != existing_item['precio_venta']:
-                        if len(existing_item['timeline']) == 0:
-                            existing_item['timeline'].append({
-                                'fecha': existing_item['datetime'],
-                                'precio_venta': existing_item['precio_venta'],
+                else:
+                    # --- LOG INFO DESPUÉS DE INSERT ---
+                    data['datetime'] = data.get('datetime', datetime.now())
+                    result = self.db[self.collection].insert_one(data)
+                    precio = data.get('precio_arriendo') or data.get(
+                        'precio_venta', 'N/A')
+                    self.logger.info(
+                        f"Item INSERTADO [Metrocuadrado]: Codigo={codigo}, Precio={precio}, ID={result.inserted_id}")
+
+            elif spider.name == 'habi':
+                existing_item = self.db[self.collection].find_one(
+                    {'codigo': data['codigo']})
+                if existing_item:
+                    update_data = existing_item
+                    update_data['last_view'] = datetime.now()
+                    timeline = update_data.setdefault('timeline', [])
+                    price_changed = False
+
+                    field = 'precio_venta'
+                    if field in data and data[field] != update_data.get(field):
+                        if not timeline:
+                            timeline.append({
+                                'fecha': update_data.get('datetime', datetime.now()),
+                                field: update_data.get(field)
                             })
-
-                        existing_item['timeline'].append({
+                        timeline.append({
                             'fecha': datetime.now(),
-                            'precio_venta': data['precio_venta'],
+                            field: data[field],
                         })
-                        
-                        existing_item['precio_venta'] = data['precio_venta']
-                except KeyError:
-                    pass
+                        update_data[field] = data[field]
+                        price_changed = True
+                    elif field not in update_data and field in data:
+                        update_data[field] = data[field]
+                        price_changed = True
 
-                self.db[self.collection].update_one({'codigo': data['codigo']}, {'$set': existing_item})
+                    # ... otros campos a actualizar para Habi ...
 
-            else:
-                # Inserta el item en la base de datos si no existe
-                self.db[self.collection].insert_one(data)
+                    result = self.db[self.collection].update_one(
+                        {'codigo': data['codigo']}, {'$set': update_data})
 
+                    # --- LOG INFO DESPUÉS DE UPDATE ---
+                    if result.modified_count > 0 or price_changed:
+                        precio = update_data.get('precio_venta', 'N/A')
+                        tipo_propiedad = data.get('tipo_propiedad', 'N/A')
+                        tipo_operacion = data.get('tipo_operacion', 'N/A')
+                        self.logger.info(
+                            f"Item ACTUALIZADO [Habi]: Codigo={codigo}, Precio={precio}, Modificado={result.modified_count > 0}, CambioPrecio={price_changed}, TipoPropiedad={tipo_propiedad}, TipoOperacion={tipo_operacion}")
+                    # else: (Opcional: log debug si no hubo cambios)
+                    #    self.logger.debug(f"Item sin cambios detectados [Habi]: Codigo={codigo}")
+
+                else:
+                    # --- LOG INFO DESPUÉS DE INSERT ---
+                    data['datetime'] = data.get('datetime', datetime.now())
+                    result = self.db[self.collection].insert_one(data)
+                    precio = data.get('precio_venta', 'N/A')
+                    self.logger.info(
+                        f"Item INSERTADO [Habi]: Codigo={codigo}, Precio={precio}, ID={result.inserted_id}")
+
+            elif spider.name == 'metrocuadrado_search':
+                # No guarda, solo retorna
+                self.logger.debug(
+                    f"Item pasado sin guardar [metrocuadrado_search]: Codigo={codigo}")
+                # No hay operación DB, retorna directamente el item
+
+            else:  # Caso por defecto o para otros spiders no especificados
+                # --- LOG INFO DESPUÉS DE INSERT (Fallback) ---
+                data['datetime'] = data.get('datetime', datetime.now())
+                result = self.db[self.collection].insert_one(data)
+                precio = data.get('precio_arriendo') or data.get(
+                    'precio_venta', 'N/A')
+                self.logger.info(
+                    f"Item INSERTADO [{spider.name}]: Codigo={codigo}, Precio={precio}, ID={result.inserted_id}")
+
+            # Si todo va bien dentro del try, devuelve el item
             return item
-        
-        elif spider.name == 'metrocuadrado_search':
-            return item
-            
-        self.db[self.collection].insert_one(data)
-        return item
+
+        # Manejo de errores específicos y generales
+        except pymongo.errors.PyMongoError as e:
+            self.logger.error(
+                f"Error de MongoDB procesando item {codigo} para spider {spider.name}: {e}", exc_info=True)
+            raise DropItem(f"Database error processing item {codigo}: {e}")
+        except KeyError as e:
+            self.logger.error(
+                f"KeyError procesando item {codigo} para spider {spider.name}: Falta la clave {e}", exc_info=True)
+            raise DropItem(f"Missing key {e} in item {codigo}")
+        except Exception as e:
+            self.logger.error(
+                f"Error inesperado procesando item {codigo} para spider {spider.name}: {e}", exc_info=True)
+            raise DropItem(f"Unexpected error processing item {codigo}: {e}")

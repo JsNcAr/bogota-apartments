@@ -21,7 +21,7 @@ class HabiSpider(scrapy.Spider):
     def start_requests(self):
         '''
         This function is used to obtain the metrosquare API data by iterating on the operation types and API offsets.
-        
+
         :return: scrapy.Request
         '''
         headers = {
@@ -40,7 +40,7 @@ class HabiSpider(scrapy.Spider):
     def parse(self, response):
         """
         This function is used to parse the response from the start_requests function and extract the apartment data.
-        
+
         :param response: scrapy.Response
         :return: scrapy.Request
         """
@@ -65,67 +65,77 @@ class HabiSpider(scrapy.Spider):
     def parse_details(self, response):
         """
         This function is used to parse the response from the parse function and extract the apartment details.
-        
+
         :param response: scrapy.Response
         :return: scrapy.Item
         """
         details = json.loads(response.body)['result']['pageContext']
 
         loader = ItemLoader(item=ApartmentsItem(), selector=details)
-        #codigo
+        # codigo
         loader.add_value('codigo', details['propertyId'])
 
         details = details['propertyDetail']['property']
-        #tipo propiedad
-        loader.add_value('tipo_propiedad', details['detalles_propiedad']['tipo_inmueble'])
-        #tipo operacion
+        # tipo propiedad
+        loader.add_value('tipo_propiedad',
+                         details['detalles_propiedad']['tipo_inmueble'])
+        # tipo operacion
         loader.add_value('tipo_operacion', 'venta')
-        #precio ventas
-        loader.add_value('precio_venta', details['detalles_propiedad']['precio_venta'])
-        #area
+        # precio ventas
+        loader.add_value(
+            'precio_venta', details['detalles_propiedad']['precio_venta'])
+        # area
         loader.add_value('area', details['detalles_propiedad']['area'])
-        #habitaciones
-        loader.add_value('habitaciones', details['detalles_propiedad']['num_habitaciones'])
-        #baños
+        # habitaciones
+        loader.add_value(
+            'habitaciones', details['detalles_propiedad']['num_habitaciones'])
+        # baños
         loader.add_value('banos', details['detalles_propiedad']['baños'])
-        #administracion
-        loader.add_value('administracion', details['detalles_propiedad']['last_admin_price'])
-        #parqueaderos
-        loader.add_value('parqueaderos', details['detalles_propiedad']['garajes'])
-        #sector
-        loader.add_value('sector', details['detalles_propiedad']['zona_mediana'])
-        #estrato 
-        loader.add_value('estrato', details['detalles_propiedad']['estrato'])
-        #estado
-        #antiguedad
-        loader.add_value('antiguedad', details['detalles_propiedad']['anos_antiguedad'])
-        #latitud
+        # administracion
+        loader.add_value('administracion',
+                         details['detalles_propiedad']['last_admin_price'])
+        # parqueaderos
+        loader.add_value(
+            'parqueaderos', details['detalles_propiedad']['garajes'])
+        # sector
+        loader.add_value(
+            'sector', details['detalles_propiedad']['zona_mediana'])
+        # estrato
+        loader.add_value('estrato', details.try_get(
+            ['detalles_propiedad', 'estrato'], default=None))
+        # estado
+        # antiguedad
+        loader.add_value(
+            'antiguedad', details['detalles_propiedad']['anos_antiguedad'])
+        # latitud
         loader.add_value('latitud', details['detalles_propiedad']['latitud'])
-        #langitud
+        # langitud
         loader.add_value('longitud', details['detalles_propiedad']['longitud'])
-        #direccion
-        loader.add_value('direccion', details['detalles_propiedad']['direccion'])
-        #featured_interior
-        loader.add_value('caracteristicas', details['caracteristicas_propiedad'])
-        #featured_exterior
-        #featured_zona_comun
-        #featured_sector
-        #descripcion
+        # direccion
+        loader.add_value(
+            'direccion', details['detalles_propiedad']['direccion'])
+        # featured_interior
+        loader.add_value('caracteristicas',
+                         details['caracteristicas_propiedad'])
+        # featured_exterior
+        # featured_zona_comun
+        # featured_sector
+        # descripcion
         loader.add_value('descripcion', details['descripcion'])
-        #compañia
-        #imagenes
+        # compañia
+        # imagenes
         images = []
         for image in details['images']:
             url = f'https://d3hzflklh28tts.cloudfront.net/{image["url"]}?d=400x400'
             images.append(url)
         loader.add_value('imagenes', images)
-        #website
+        # website
         loader.add_value('website', 'habi.co')
-        #last_view
+        # last_view
         loader.add_value('last_view', datetime.now())
-        #datetime
+        # datetime
         loader.add_value('datetime', datetime.now())
-        #url
+        # url
         loader.add_value('url', response.url)
 
         yield loader.load_item()
@@ -146,4 +156,3 @@ class HabiSpider(scrapy.Spider):
             return value
         except (KeyError, TypeError, IndexError):
             return None  #
-        

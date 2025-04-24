@@ -101,8 +101,8 @@ class HabiSpider(scrapy.Spider):
         loader.add_value(
             'sector', details['detalles_propiedad']['zona_mediana'])
         # estrato
-        loader.add_value('estrato', details.try_get(
-            ['detalles_propiedad', 'estrato'], default=None))
+        loader.add_value(
+            'estrato', details['detalles_propiedad'].get('estrato', ''))
         # estado
         # antiguedad
         loader.add_value(
